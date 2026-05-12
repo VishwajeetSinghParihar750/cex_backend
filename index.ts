@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express, {
   type NextFunction,
   type Request,
@@ -7,7 +8,19 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/prisma/client.js";
 import jwt, { type JwtPayload } from "jsonwebtoken";
 import { createClient } from "redis";
-import { error } from "node:console";
+import z from "zod";
+import { signinSchema, signupSchema } from "./types/zod/auth.js";
+import {
+  depthGetParamsSchema,
+  orderDeleteParamsSchema,
+  orderGetParamsSchema,
+  orderPostSchema,
+} from "./types/zod/order.js";
+import {
+  balanceGetParamsSchema,
+  depositPostParamsSchema,
+  depositPostSchema,
+} from "./types/zod/balance.js";
 
 const prismaPgAdapter = new PrismaPg({
   connectionString: process.env.DATABASE_URL!,
@@ -49,7 +62,7 @@ async function getEngineResponseForRequest(type: string, payload: any) {
 function authMiddleware(req: Request, res: Response, next: NextFunction) {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) {
-    res.status(401).json({ error: true, result: "unauthorized" });
+    res.status(401).json({ error: true, payload: "unauthorized" });
     return;
   }
   try {
@@ -61,11 +74,32 @@ function authMiddleware(req: Request, res: Response, next: NextFunction) {
 
     next();
   } catch (error) {
-    res.status(401).json({ error: true, result: "unauthorized" });
+    res.status(401).json({ error: true, payload: "unauthorized" });
   }
 }
 
-app.post("/signup", async (req, res) => {
+const zodBodyVerification =
+  (schema: z.ZodObject) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    try {
+      schema.parse(req.body);
+      next();
+    } catch (error) {
+      res.status(400).json({ error: true, payload: "WRONG_REQUEST_FORMAT" });
+    }
+  };
+const zodParamsVerification =
+  (schema: z.ZodObject) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    try {
+      schema.parse(req.params);
+      next();
+    } catch (error) {
+      res.status(400).json({ error: true, payload: "WRONG_REQUEST_FORMAT" });
+    }
+  };
+
+app.post("/signup", zodBodyVerification(signupSchema), async (req, res) => {
   //
   try {
     const { username, password } = req.body;
@@ -73,25 +107,27 @@ app.post("/signup", async (req, res) => {
       where: { username },
     });
     if (findUser) {
-      res.status(403).json({ error: true, result: "username already exists" });
+      res.status(403).json({ error: true, payload: "username already exists" });
       return;
     }
     const user = await prisma.users.create({ data: { username, password } });
 
-    res.status(201).json({ error: false, result: user.id });
+    res.status(201).json({ error: false, payload: user.id });
   } catch (e) {
-    res.status(500).json({ error: true, result: "server error" });
+    console.error(e);
+    res.status(500).json({ error: true, payload: "server error" });
   }
 });
 
-app.post("/signin", async (req, res) => {
+app.post("/signin", zodBodyVerification(signinSchema), async (req, res) => {
   try {
     const { username, password } = req.body;
+
     const user = await prisma.users.findUnique({
       where: { username },
     });
     if (!user || user.password != password) {
-      res.status(400).json({ error: true, result: "incorrect credentials" });
+      res.status(400).json({ error: true, payload: "incorrect credentials" });
       return;
     }
 
@@ -102,96 +138,127 @@ app.post("/signin", async (req, res) => {
 
     res.status(200).json({
       error: false,
-      result: {
+      payload: {
         jwt_token,
       },
     });
   } catch (error) {
-    res.status(500).json({ error: true, result: "server error" });
-  }
-});
-
-app.post("/deposit", authMiddleware, async (req, res) => {
-  const { amount } = req.body;
-  try {
-    const { type, payload } = await getEngineResponseForRequest("add_balance", {
-      userId: req.user?.id,
-      amount,
-    });
-
-    if (type == "error") {
-      res.status(400).json({ error: true, payload });
-    } else res.status(200).json({ error: false, payload: null });
-  } catch (error) {
     console.error(error);
-    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+    res.status(500).json({ error: true, payload: "server error" });
   }
 });
 
-app.post("/order", authMiddleware, async (req, res) => {
-  const { type, price, qty, symbol, side } = req.body;
+app.post(
+  "/deposit/:symbol",
+  authMiddleware,
+  zodBodyVerification(depositPostSchema),
+  zodParamsVerification(depositPostParamsSchema),
+  async (req, res) => {
+    const { amount } = req.body;
+    try {
+      const { type, payload } = await getEngineResponseForRequest(
+        "add_balance",
+        {
+          userId: req.user?.id,
+          amount,
+          symbol: req.params.symbol,
+        },
+      );
 
-  try {
-    const { type: resType, payload } = await getEngineResponseForRequest(
-      "create_order",
-      { type, side, price, qty, symbol, userId: req.user!.id },
-    );
+      if (type == "error") {
+        res.status(400).json({ error: true, payload });
+      } else res.status(200).json({ error: false, payload: null });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+    }
+  },
+);
 
-    if (resType == "error") {
-      res.status(400).json({ error: true, payload });
-    } else res.status(200).json({ error: false, payload });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
-  }
-});
+app.post(
+  "/order",
+  authMiddleware,
+  zodBodyVerification(orderPostSchema),
+  async (req, res) => {
+    const { type, price, qty, symbol, side } = req.body;
 
-app.get("/order/:orderId", authMiddleware, async (req, res) => {
-  try {
-    const { type: resType, payload } = await getEngineResponseForRequest(
-      "get_order",
-      { orderId: req.params.orderId },
-    );
+    try {
+      const { type: resType, payload } = await getEngineResponseForRequest(
+        "create_order",
+        { type, side, price, qty, symbol, userId: req.user!.id },
+      );
 
-    if (resType == "error") {
-      res.status(400).json({ error: true, payload });
-    } else res.status(200).json({ error: false, payload });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
-  }
-});
+      if (resType == "error") {
+        res.status(400).json({ error: true, payload });
+      } else res.status(200).json({ error: false, payload });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+    }
+  },
+);
 
-app.delete("/order/:orderId", authMiddleware, async (req, res) => {
-  try {
-    const { type: resType, payload } = await getEngineResponseForRequest(
-      "cancel_order",
-      { orderId: req.params.orderId },
-    );
+app.get(
+  "/order/:orderId",
+  authMiddleware,
+  zodParamsVerification(orderGetParamsSchema),
+  async (req, res) => {
+    try {
+      const { type: resType, payload } = await getEngineResponseForRequest(
+        "get_order",
+        { orderId: req.params.orderId },
+      );
 
-    if (resType == "error") {
-      res.status(400).json({ error: true, payload });
-    } else res.status(200).json({ error: false, payload });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
-  }
-});
-app.get("/depth/:symbol", async (req, res) => {
-  try {
-    const { type: resType, payload } = await getEngineResponseForRequest(
-      "get_depth",
-      { symbol: req.params.symbol },
-    );
+      if (resType == "error") {
+        res.status(400).json({ error: true, payload });
+      } else res.status(200).json({ error: false, payload });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+    }
+  },
+);
 
-    if (resType == "error") {
-      res.status(400).json({ error: true, payload });
-    } else res.status(200).json({ error: false, payload });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
-  }
-});
+app.delete(
+  "/order/:orderId",
+  zodParamsVerification(orderDeleteParamsSchema),
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const { type: resType, payload } = await getEngineResponseForRequest(
+        "cancel_order",
+        { orderId: req.params.orderId },
+      );
+
+      if (resType == "error") {
+        res.status(400).json({ error: true, payload });
+      } else res.status(200).json({ error: false, payload });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+    }
+  },
+);
+
+app.get(
+  "/depth/:symbol",
+  zodParamsVerification(depthGetParamsSchema),
+  async (req, res) => {
+    try {
+      const { type: resType, payload } = await getEngineResponseForRequest(
+        "get_depth",
+        { symbol: req.params.symbol },
+      );
+
+      if (resType == "error") {
+        res.status(400).json({ error: true, payload });
+      } else res.status(200).json({ error: false, payload });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+    }
+  },
+);
 
 app.get("/orders", authMiddleware, async (req, res) => {
   try {
@@ -225,24 +292,29 @@ app.get("/fills", async (req, res) => {
   }
 });
 
-app.get("/balance/:symbol", authMiddleware, async (req, res) => {
-  try {
-    const { type: resType, payload } = await getEngineResponseForRequest(
-      "get_balance",
-      {
-        userId: req.user?.id,
-        symbol: req.params.symbol?.toString()?.toUpperCase(),
-      },
-    );
-
-    if (resType == "error") {
-      res.status(400).json({ error: true, payload });
-    } else res.status(200).json({ error: false, payload });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
-  }
-});
+app.get(
+  "/balance{/:symbol}",
+  authMiddleware,
+  zodParamsVerification(balanceGetParamsSchema),
+  async (req, res) => {
+    try {
+      const { type: resType, payload } = await getEngineResponseForRequest(
+        "get_balance",
+        {
+          userId: req.user?.id,
+          symbol: req.params.symbol?.toString()?.toUpperCase(),
+        },
+      );
+      console.log("payload", payload, "type ", resType);
+      if (resType == "error") {
+        res.status(400).json({ error: true, payload });
+      } else res.status(200).json({ error: false, payload });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+    }
+  },
+);
 
 async function setupServer() {
   redisClient.on("error", (err) => {
@@ -250,8 +322,10 @@ async function setupServer() {
   });
 
   await redisClient.connect();
+  console.log("REDIS SET UP DONE");
 
   app.listen(3001);
+  console.log("LISTENING ON PORT 3001");
 }
 
 setupServer();
