@@ -1,7 +1,12 @@
-import express from "express";
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/prisma/client.js";
-import jwt from "jsonwebtoken";
+import jwt, { type JwtPayload } from "jsonwebtoken";
+import { decode } from "node:punycode";
 
 const prismaPgAdapter = new PrismaPg({
   connectionString: process.env.DATABASE_URL!,
@@ -11,10 +16,9 @@ const prisma = new PrismaClient({ adapter: prismaPgAdapter });
 const app = express();
 
 app.use(express.json());
-
 //
 
-function authMiddleware(req, res, next) {
+function authMiddleware(req: Request, res: Response, next: NextFunction) {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) {
     res.status(401).json({ error: true, result: "unauthorized" });
@@ -25,7 +29,8 @@ function authMiddleware(req, res, next) {
       token,
       process.env.JWT_SECRET_KEY!,
     ) as JwtPayload;
-    req.user = decoded;
+    req.user = { username: decoded.username, id: decoded.id };
+
     next();
   } catch (error) {
     res.status(401).json({ error: true, result: "unauthorized" });
