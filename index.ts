@@ -6,7 +6,8 @@ import express, {
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/prisma/client.js";
 import jwt, { type JwtPayload } from "jsonwebtoken";
-import { decode } from "node:punycode";
+import { createClient } from "redis";
+import { error } from "node:console";
 
 const prismaPgAdapter = new PrismaPg({
   connectionString: process.env.DATABASE_URL!,
@@ -14,9 +15,36 @@ const prismaPgAdapter = new PrismaPg({
 const prisma = new PrismaClient({ adapter: prismaPgAdapter });
 
 const app = express();
+const redisClient = createClient({ url: process.env.REDIS_URL! });
 
 app.use(express.json());
+
 //
+
+async function getEngineResponse(requestId: string) {
+  let res = await redisClient.blPop(`engine_response_${requestId}`, 0);
+  if (res && res.element) {
+    return JSON.parse(res.element);
+  }
+  throw new Error("ERROR IN GETTING ENGINE RESPONSE");
+}
+
+// returns request id of request to look for in response
+async function sendEngineRequest(type: string, payload: any): Promise<string> {
+  let id: string = crypto.randomUUID();
+
+  await redisClient.rPush(
+    "engine_request",
+    JSON.stringify({ requestId: id, type, payload }),
+  );
+
+  return id;
+}
+
+async function getEngineResponseForRequest(type: string, payload: any) {
+  let id = await sendEngineRequest(type, payload);
+  return await getEngineResponse(id);
+}
 
 function authMiddleware(req: Request, res: Response, next: NextFunction) {
   const token = req.headers.authorization?.split(" ")[1];
@@ -83,36 +111,147 @@ app.post("/signin", async (req, res) => {
   }
 });
 
-app.post("/deposit", authMiddleware, async (req, res) => {});
-
-app.post("/order", authMiddleware, async (req, res) => {
-  const { type, price, qty, stock_id, side } = req.body;
-});
-/*
-    returns the status of an order (partially filled, success, cancellled)
-    ALSO RETURNS THE INDIVIDUAL FILLS OF THIS ORDER
-*/
-
-app.get("/order/:orderId", authMiddleware, async (req, res) => {});
-app.delete("/order/:orderId", authMiddleware, (req, res) => {});
-app.get("/depth/:symbol", async (req, res) => {});
-
-app.get("/orders", authMiddleware, async (req, res) => {
+app.post("/deposit", authMiddleware, async (req, res) => {
+  const { amount } = req.body;
   try {
-    const orders = await prisma.orders.findMany();
-    res.status(200).json({ error: false, result: orders });
+    const { type, payload } = await getEngineResponseForRequest("add_balance", {
+      userId: req.user?.id,
+      amount,
+    });
+
+    if (type == "error") {
+      res.status(400).json({ error: true, payload });
+    } else res.status(200).json({ error: false, payload: null });
   } catch (error) {
-    res.status(500).json({ error: "server error", result: null });
+    console.error(error);
+    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
   }
 });
 
-app.get("/fills", async (req, res) => {});
+app.post("/order", authMiddleware, async (req, res) => {
+  const { type, price, qty, symbol, side } = req.body;
 
-app.get("/balance/usd", authMiddleware, (req, res) => {});
+  try {
+    const { type: resType, payload } = await getEngineResponseForRequest(
+      "create_order",
+      { type, side, price, qty, symbol, userId: req.user!.id },
+    );
 
-// /*
-//     Returns the balance of all stocks
-// */
-app.get("/balance", authMiddleware, (req, res) => {});
+    if (resType == "error") {
+      res.status(400).json({ error: true, payload });
+    } else res.status(200).json({ error: false, payload });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+  }
+});
 
-app.listen(3000);
+app.get("/order/:orderId", authMiddleware, async (req, res) => {
+  try {
+    const { type: resType, payload } = await getEngineResponseForRequest(
+      "get_order",
+      { orderId: req.params.orderId },
+    );
+
+    if (resType == "error") {
+      res.status(400).json({ error: true, payload });
+    } else res.status(200).json({ error: false, payload });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+  }
+});
+
+app.delete("/order/:orderId", authMiddleware, async (req, res) => {
+  try {
+    const { type: resType, payload } = await getEngineResponseForRequest(
+      "cancel_order",
+      { orderId: req.params.orderId },
+    );
+
+    if (resType == "error") {
+      res.status(400).json({ error: true, payload });
+    } else res.status(200).json({ error: false, payload });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+  }
+});
+app.get("/depth/:symbol", async (req, res) => {
+  try {
+    const { type: resType, payload } = await getEngineResponseForRequest(
+      "get_depth",
+      { symbol: req.params.symbol },
+    );
+
+    if (resType == "error") {
+      res.status(400).json({ error: true, payload });
+    } else res.status(200).json({ error: false, payload });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+  }
+});
+
+app.get("/orders", authMiddleware, async (req, res) => {
+  try {
+    const { type: resType, payload } = await getEngineResponseForRequest(
+      "get_orders",
+      {},
+    );
+
+    if (resType == "error") {
+      res.status(400).json({ error: true, payload });
+    } else res.status(200).json({ error: false, payload });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+  }
+});
+
+app.get("/fills", async (req, res) => {
+  try {
+    const { type: resType, payload } = await getEngineResponseForRequest(
+      "get_fills",
+      {},
+    );
+
+    if (resType == "error") {
+      res.status(400).json({ error: true, payload });
+    } else res.status(200).json({ error: false, payload });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+  }
+});
+
+app.get("/balance/:symbol", authMiddleware, async (req, res) => {
+  try {
+    const { type: resType, payload } = await getEngineResponseForRequest(
+      "get_balance",
+      {
+        userId: req.user?.id,
+        symbol: req.params.symbol?.toString()?.toUpperCase(),
+      },
+    );
+
+    if (resType == "error") {
+      res.status(400).json({ error: true, payload });
+    } else res.status(200).json({ error: false, payload });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+  }
+});
+
+async function setupServer() {
+  redisClient.on("error", (err) => {
+    console.log("redis error : ", err);
+  });
+
+  await redisClient.connect();
+
+  app.listen(3001);
+}
+
+setupServer();
