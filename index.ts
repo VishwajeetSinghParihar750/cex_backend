@@ -8,7 +8,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/prisma/client.js";
 import jwt, { type JwtPayload } from "jsonwebtoken";
 import { createClient } from "redis";
-import z, { json } from "zod";
+import z from "zod";
 import { signinSchema, signupSchema } from "./types/zod/auth.js";
 import {
   createOrderSchema,
@@ -17,9 +17,14 @@ import {
   getOrderSchema,
 } from "./types/zod/order.js";
 import { addBalanceSchema, getBalanceSchema } from "./types/zod/balance.js";
+import {
+  subscribeEventSchema,
+  unsubscribeEventSchema,
+} from "./types/zod/subscribeEvent.js";
 
 import WebSocket, { WebSocketServer } from "ws";
 import type { IncomingMessage } from "node:http";
+import { HashSet } from "js-sdsl";
 
 const prismaPgAdapter = new PrismaPg({
   connectionString: process.env.DATABASE_URL!,
@@ -36,6 +41,8 @@ app.use(express.json());
 //
 
 type WS_REQUEST_TYPE =
+  | "subscribe_event"
+  | "unsubscribe_event"
   | "create_order"
   | "cancel_order"
   | "get_balance"
@@ -46,6 +53,8 @@ type WS_REQUEST_TYPE =
   | "get_fills";
 
 type WS_RESPONSE_TYPE =
+  | "event_subscribed"
+  | "event_unsubscribed"
   | "order_created"
   | "order_cancelled"
   | "balance"
@@ -54,7 +63,9 @@ type WS_RESPONSE_TYPE =
   | "orders"
   | "order"
   | "fills"
-  | "error"; // for anything that did not succeed
+  | "error" // for anything that did not succeed
+  | "orderbook_update_btc_usd"
+  | "orderbook_update_sol_usd";
 
 type WS_REQUEST = {
   type: WS_REQUEST_TYPE;
@@ -64,7 +75,7 @@ type WS_REQUEST = {
 type WS_RESPONSE = {
   type: WS_RESPONSE_TYPE;
   payload: any;
-  requestId: string;
+  requestId?: string;
 };
 
 async function getEngineResponse(requestId: string) {
@@ -444,8 +455,125 @@ async function handleGetBalanceRequest(req: WS_REQUEST, ws: WebSocket) {
   }
 }
 
+type SUBSCRIBED_EVENT = "orderbook_update_sol_usd" | "orderbook_update_btc_usd";
+
+let eventSubscriptions: Record<SUBSCRIBED_EVENT, HashSet<WebSocket>> = {
+  orderbook_update_btc_usd: new HashSet(),
+  orderbook_update_sol_usd: new HashSet(),
+};
+
+function setupEventSubscriptionHandling() {
+  publishOrderbookUpdateEvents();
+}
+async function publishOrderbookUpdateEvents() {
+  //
+  const currentRedisClient = redisClient.duplicate();
+  // duplicating coz this client will be kept on hold on block and no other guy would be able to use it, so creating a separate one from global redisClient
+  // this will creaate a new client
+
+  await currentRedisClient.connect();
+
+  while (true) {
+    const streamsReadResponse = await currentRedisClient.xRead(
+      [
+        { id: "$", key: "orderbook_update_btc_usd" },
+        { id: "$", key: "orderbook_update_sol_usd" },
+      ],
+      {
+        BLOCK: 0,
+        COUNT: 100,
+      },
+    );
+    // {
+    //   name: string;
+    //   messages: {
+    //       id: string;
+    //       message: {
+    //           [x: string]: string;
+    //       };
+    //   }[]
+
+    (streamsReadResponse as any).forEach((streamReadResponse: any) => {
+      (streamReadResponse as any).messages.forEach(
+        ({ message }: { message: any }) => {
+          let subscriptions =
+            eventSubscriptions[streamReadResponse.name as SUBSCRIBED_EVENT];
+          if (subscriptions.empty()) return;
+
+          const {
+            offset,
+            data,
+          }: { offset: number; data: { price: number; qty: number }[] } =
+            message;
+
+          subscriptions.forEach((ws) => {
+            sendMessageOnWebSocket(ws, {
+              payload: { offset, data },
+              type: streamReadResponse.name as SUBSCRIBED_EVENT,
+            });
+          });
+        },
+      );
+    });
+  }
+}
+
+async function handleSubscribeEventRequest(req: WS_REQUEST, ws: WebSocket) {
+  if (zodBodyVerificationWebSocket(subscribeEventSchema, req, ws)) {
+    const { eventType }: { eventType: SUBSCRIBED_EVENT } = req.payload;
+
+    switch (eventType) {
+      case "orderbook_update_btc_usd":
+        eventSubscriptions.orderbook_update_btc_usd.insert(ws);
+        break;
+      case "orderbook_update_sol_usd":
+        eventSubscriptions.orderbook_update_sol_usd.insert(ws);
+        break;
+
+      default:
+        break;
+    }
+
+    sendMessageOnWebSocket(ws, {
+      requestId: req.rqeuestId,
+      type: "event_subscribed",
+      payload: null,
+    });
+  }
+}
+
+async function handleUnsubscribeEventRequest(req: WS_REQUEST, ws: WebSocket) {
+  if (zodBodyVerificationWebSocket(unsubscribeEventSchema, req, ws)) {
+    const { eventType }: { eventType: SUBSCRIBED_EVENT } = req.payload;
+
+    switch (eventType) {
+      case "orderbook_update_btc_usd":
+        eventSubscriptions.orderbook_update_btc_usd.eraseElementByKey(ws);
+        break;
+      case "orderbook_update_sol_usd":
+        eventSubscriptions.orderbook_update_sol_usd.eraseElementByKey(ws);
+        break;
+
+      default:
+        break;
+    }
+
+    sendMessageOnWebSocket(ws, {
+      requestId: req.rqeuestId,
+      type: "event_unsubscribed",
+      payload: null,
+    });
+  }
+}
+
 const handleWebSocketMessage = async (ws: WebSocket, request: WS_REQUEST) => {
   switch (request.type) {
+    case "subscribe_event":
+      await handleSubscribeEventRequest(request, ws);
+      break;
+    case "unsubscribe_event":
+      await handleUnsubscribeEventRequest(request, ws);
+      break;
     case "add_balance":
       await handleAddBalanceRequest(request, ws);
       break;
@@ -497,12 +625,15 @@ function verifyJwtToken(ws: WebSocket, req: IncomingMessage): boolean {
     return false;
   }
 }
+
 async function setupServer() {
   redisClient.on("error", (err) => {
     console.log("redis error : ", err);
   });
 
   await redisClient.connect();
+  setupEventSubscriptionHandling();
+
   console.log("REDIS SET UP DONE");
 
   wss.on("connection", (ws, req) => {
