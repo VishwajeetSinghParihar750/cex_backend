@@ -8,19 +8,18 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/prisma/client.js";
 import jwt, { type JwtPayload } from "jsonwebtoken";
 import { createClient } from "redis";
-import z from "zod";
+import z, { json } from "zod";
 import { signinSchema, signupSchema } from "./types/zod/auth.js";
 import {
-  depthGetParamsSchema,
-  orderDeleteParamsSchema,
-  orderGetParamsSchema,
-  orderPostSchema,
+  createOrderSchema,
+  deleteOrderSchema,
+  getDepthSchema,
+  getOrderSchema,
 } from "./types/zod/order.js";
-import {
-  balanceGetParamsSchema,
-  depositPostParamsSchema,
-  depositPostSchema,
-} from "./types/zod/balance.js";
+import { addBalanceSchema, getBalanceSchema } from "./types/zod/balance.js";
+
+import WebSocket, { WebSocketServer } from "ws";
+import type { IncomingMessage } from "node:http";
 
 const prismaPgAdapter = new PrismaPg({
   connectionString: process.env.DATABASE_URL!,
@@ -28,11 +27,45 @@ const prismaPgAdapter = new PrismaPg({
 const prisma = new PrismaClient({ adapter: prismaPgAdapter });
 
 const app = express();
+const wss = new WebSocketServer({ port: 8080 });
+
 const redisClient = createClient({ url: process.env.REDIS_URL! });
 
 app.use(express.json());
 
 //
+
+type WS_REQUEST_TYPE =
+  | "create_order"
+  | "cancel_order"
+  | "get_balance"
+  | "add_balance"
+  | "get_depth"
+  | "get_orders"
+  | "get_order"
+  | "get_fills";
+
+type WS_RESPONSE_TYPE =
+  | "order_created"
+  | "order_cancelled"
+  | "balance"
+  | "balance_updated"
+  | "depth"
+  | "orders"
+  | "order"
+  | "fills"
+  | "error"; // for anything that did not succeed
+
+type WS_REQUEST = {
+  type: WS_REQUEST_TYPE;
+  payload: any; // here put zod inferred types
+  rqeuestId: string;
+};
+type WS_RESPONSE = {
+  type: WS_RESPONSE_TYPE;
+  payload: any;
+  requestId: string;
+};
 
 async function getEngineResponse(requestId: string) {
   let res = await redisClient.blPop(`engine_response_${requestId}`, 0);
@@ -88,16 +121,6 @@ const zodBodyVerification =
       res.status(400).json({ error: true, payload: "WRONG_REQUEST_FORMAT" });
     }
   };
-const zodParamsVerification =
-  (schema: z.ZodObject) =>
-  (req: Request, res: Response, next: NextFunction) => {
-    try {
-      schema.parse(req.params);
-      next();
-    } catch (error) {
-      res.status(400).json({ error: true, payload: "WRONG_REQUEST_FORMAT" });
-    }
-  };
 
 app.post("/signup", zodBodyVerification(signupSchema), async (req, res) => {
   //
@@ -148,119 +171,189 @@ app.post("/signin", zodBodyVerification(signinSchema), async (req, res) => {
   }
 });
 
-app.post(
-  "/deposit/:symbol",
-  authMiddleware,
-  zodBodyVerification(depositPostSchema),
-  zodParamsVerification(depositPostParamsSchema),
-  async (req, res) => {
-    const { amount } = req.body;
+const sendMessageOnWebSocket = (ws: WebSocket, message: WS_RESPONSE) => {
+  ws.send(JSON.stringify(message));
+};
+
+const zodBodyVerificationWebSocket = (
+  schema: z.ZodObject,
+  request: WS_REQUEST,
+  ws: WebSocket,
+): boolean => {
+  const { success } = schema.safeParse(request.payload);
+  if (!success) {
+    sendMessageOnWebSocket(ws, {
+      requestId: request.rqeuestId,
+      type: "error",
+      payload: "INVALID_REQUEST_FORMAT",
+    });
+    return false;
+  }
+  return true;
+};
+
+async function handleAddBalanceRequest(req: WS_REQUEST, ws: WebSocket) {
+  if (zodBodyVerificationWebSocket(addBalanceSchema, req, ws)) {
     try {
       const { type, payload } = await getEngineResponseForRequest(
         "add_balance",
         {
-          userId: req.user?.id,
-          amount,
-          symbol: req.params.symbol,
+          userId: ws.user.id,
+          amount: req.payload.amount,
+          symbol: req.payload.symbol,
         },
       );
 
       if (type == "error") {
-        res.status(400).json({ error: true, payload });
-      } else res.status(200).json({ error: false, payload: null });
+        sendMessageOnWebSocket(ws, {
+          payload,
+          requestId: req.rqeuestId,
+          type: "error",
+        });
+      } else
+        sendMessageOnWebSocket(ws, {
+          payload: null,
+          requestId: req.rqeuestId,
+          type: "balance",
+        });
     } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+      sendMessageOnWebSocket(ws, {
+        type: "error",
+        payload: "INTERNAL_SERVER_ERROR",
+        requestId: req.rqeuestId,
+      });
     }
-  },
-);
+  }
+}
 
-app.post(
-  "/order",
-  authMiddleware,
-  zodBodyVerification(orderPostSchema),
-  async (req, res) => {
-    const { type, price, qty, symbol, side } = req.body;
-
+async function handleCreateOrderRequest(req: WS_REQUEST, ws: WebSocket) {
+  if (zodBodyVerificationWebSocket(createOrderSchema, req, ws)) {
     try {
-      const { type: resType, payload } = await getEngineResponseForRequest(
+      const { type, price, qty, symbol, side } = req.payload;
+
+      const { type: responseType, payload } = await getEngineResponseForRequest(
         "create_order",
-        { type, side, price, qty, symbol, userId: req.user!.id },
+        { type, side, price, qty, symbol, userId: ws.user.id },
       );
 
-      if (resType == "error") {
-        res.status(400).json({ error: true, payload });
-      } else res.status(200).json({ error: false, payload });
+      if (responseType == "error") {
+        sendMessageOnWebSocket(ws, {
+          payload,
+          requestId: req.rqeuestId,
+          type: "error",
+        });
+      } else
+        sendMessageOnWebSocket(ws, {
+          payload,
+          requestId: req.rqeuestId,
+          type: "order_created",
+        });
     } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+      sendMessageOnWebSocket(ws, {
+        type: "error",
+        payload: "INTERNAL_SERVER_ERROR",
+        requestId: req.rqeuestId,
+      });
     }
-  },
-);
+  }
+}
 
-app.get(
-  "/order/:orderId",
-  authMiddleware,
-  zodParamsVerification(orderGetParamsSchema),
-  async (req, res) => {
+async function handleGetOrderRequest(req: WS_REQUEST, ws: WebSocket) {
+  if (zodBodyVerificationWebSocket(getOrderSchema, req, ws)) {
     try {
+      const { orderId } = req.payload;
+
       const { type: resType, payload } = await getEngineResponseForRequest(
         "get_order",
-        { orderId: req.params.orderId },
+        { orderId },
       );
 
       if (resType == "error") {
-        res.status(400).json({ error: true, payload });
-      } else res.status(200).json({ error: false, payload });
+        sendMessageOnWebSocket(ws, {
+          payload,
+          requestId: req.rqeuestId,
+          type: "error",
+        });
+      } else
+        sendMessageOnWebSocket(ws, {
+          payload,
+          requestId: req.rqeuestId,
+          type: "order",
+        });
     } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+      sendMessageOnWebSocket(ws, {
+        type: "error",
+        payload: "INTERNAL_SERVER_ERROR",
+        requestId: req.rqeuestId,
+      });
     }
-  },
-);
+  }
+}
 
-app.delete(
-  "/order/:orderId",
-  zodParamsVerification(orderDeleteParamsSchema),
-  authMiddleware,
-  async (req, res) => {
+async function handleCancelOrderRequest(req: WS_REQUEST, ws: WebSocket) {
+  if (zodBodyVerificationWebSocket(deleteOrderSchema, req, ws)) {
     try {
+      const { orderId } = req.payload;
+
       const { type: resType, payload } = await getEngineResponseForRequest(
         "cancel_order",
-        { orderId: req.params.orderId },
+        { orderId },
       );
 
       if (resType == "error") {
-        res.status(400).json({ error: true, payload });
-      } else res.status(200).json({ error: false, payload });
+        sendMessageOnWebSocket(ws, {
+          payload,
+          requestId: req.rqeuestId,
+          type: "error",
+        });
+      } else
+        sendMessageOnWebSocket(ws, {
+          payload,
+          requestId: req.rqeuestId,
+          type: "order_cancelled",
+        });
     } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+      sendMessageOnWebSocket(ws, {
+        type: "error",
+        payload: "INTERNAL_SERVER_ERROR",
+        requestId: req.rqeuestId,
+      });
     }
-  },
-);
+  }
+}
 
-app.get(
-  "/depth/:symbol",
-  zodParamsVerification(depthGetParamsSchema),
-  async (req, res) => {
+async function handleGetDepthRequest(req: WS_REQUEST, ws: WebSocket) {
+  if (zodBodyVerificationWebSocket(getDepthSchema, req, ws)) {
     try {
+      const { symbol } = req.payload;
       const { type: resType, payload } = await getEngineResponseForRequest(
         "get_depth",
-        { symbol: req.params.symbol },
+        { symbol: symbol },
       );
 
       if (resType == "error") {
-        res.status(400).json({ error: true, payload });
-      } else res.status(200).json({ error: false, payload });
+        sendMessageOnWebSocket(ws, {
+          payload,
+          requestId: req.rqeuestId,
+          type: "error",
+        });
+      } else
+        sendMessageOnWebSocket(ws, {
+          payload,
+          requestId: req.rqeuestId,
+          type: "depth",
+        });
     } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+      sendMessageOnWebSocket(ws, {
+        type: "error",
+        payload: "INTERNAL_SERVER_ERROR",
+        requestId: req.rqeuestId,
+      });
     }
-  },
-);
+  }
+}
 
-app.get("/orders", authMiddleware, async (req, res) => {
+async function handleGetOrdersRequest(req: WS_REQUEST, ws: WebSocket) {
   try {
     const { type: resType, payload } = await getEngineResponseForRequest(
       "get_orders",
@@ -268,15 +361,27 @@ app.get("/orders", authMiddleware, async (req, res) => {
     );
 
     if (resType == "error") {
-      res.status(400).json({ error: true, payload });
-    } else res.status(200).json({ error: false, payload });
+      sendMessageOnWebSocket(ws, {
+        payload,
+        requestId: req.rqeuestId,
+        type: "error",
+      });
+    } else
+      sendMessageOnWebSocket(ws, {
+        payload,
+        requestId: req.rqeuestId,
+        type: "orders",
+      });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+    sendMessageOnWebSocket(ws, {
+      type: "error",
+      payload: "INTERNAL_SERVER_ERROR",
+      requestId: req.rqeuestId,
+    });
   }
-});
+}
 
-app.get("/fills", async (req, res) => {
+async function handleGetFillsRequest(req: WS_REQUEST, ws: WebSocket) {
   try {
     const { type: resType, payload } = await getEngineResponseForRequest(
       "get_fills",
@@ -284,38 +389,114 @@ app.get("/fills", async (req, res) => {
     );
 
     if (resType == "error") {
-      res.status(400).json({ error: true, payload });
-    } else res.status(200).json({ error: false, payload });
+      sendMessageOnWebSocket(ws, {
+        payload,
+        requestId: req.rqeuestId,
+        type: "error",
+      });
+    } else
+      sendMessageOnWebSocket(ws, {
+        payload,
+        requestId: req.rqeuestId,
+        type: "fills",
+      });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
+    sendMessageOnWebSocket(ws, {
+      type: "error",
+      payload: "INTERNAL_SERVER_ERROR",
+      requestId: req.rqeuestId,
+    });
   }
-});
+}
 
-app.get(
-  "/balance{/:symbol}",
-  authMiddleware,
-  zodParamsVerification(balanceGetParamsSchema),
-  async (req, res) => {
+async function handleGetBalanceRequest(req: WS_REQUEST, ws: WebSocket) {
+  if (zodBodyVerificationWebSocket(getBalanceSchema, req, ws)) {
     try {
+      const { symbol } = req.payload;
+
       const { type: resType, payload } = await getEngineResponseForRequest(
         "get_balance",
         {
-          userId: req.user?.id,
-          symbol: req.params.symbol?.toString()?.toUpperCase(),
+          userId: ws.user.id,
+          symbol,
         },
       );
-      console.log("payload", payload, "type ", resType);
-      if (resType == "error") {
-        res.status(400).json({ error: true, payload });
-      } else res.status(200).json({ error: false, payload });
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: true, payload: "INTERNAL_SERVER_ERROR" });
-    }
-  },
-);
 
+      if (resType == "error") {
+        sendMessageOnWebSocket(ws, {
+          payload,
+          requestId: req.rqeuestId,
+          type: "error",
+        });
+      } else
+        sendMessageOnWebSocket(ws, {
+          payload,
+          requestId: req.rqeuestId,
+          type: "balance",
+        });
+    } catch (error) {
+      sendMessageOnWebSocket(ws, {
+        type: "error",
+        payload: "INTERNAL_SERVER_ERROR",
+        requestId: req.rqeuestId,
+      });
+    }
+  }
+}
+
+const handleWebSocketMessage = async (ws: WebSocket, request: WS_REQUEST) => {
+  switch (request.type) {
+    case "add_balance":
+      await handleAddBalanceRequest(request, ws);
+      break;
+    case "cancel_order":
+      await handleCancelOrderRequest(request, ws);
+      break;
+
+    case "create_order":
+      await handleCreateOrderRequest(request, ws);
+      break;
+    case "get_balance":
+      await handleGetBalanceRequest(request, ws);
+      break;
+    case "get_depth":
+      await handleGetDepthRequest(request, ws);
+      break;
+    case "get_fills":
+      await handleGetFillsRequest(request, ws);
+      break;
+    case "get_order":
+      await handleGetOrderRequest(request, ws);
+      break;
+    case "get_orders":
+      await handleGetOrdersRequest(request, ws);
+      break;
+
+    default:
+      throw new Error("WRONG_REQUEST_FORMAT");
+  }
+};
+
+function verifyJwtToken(ws: WebSocket, req: IncomingMessage): boolean {
+  //
+  try {
+    if (!req.url) return false;
+    const url = new URL(req.url, "http://anythingWorksHere");
+    const jwt_token = url.searchParams.get("jwt_token");
+
+    if (!jwt_token) return false;
+
+    const decodedUser = jwt.verify(
+      jwt_token,
+      process.env.JWT_SECRET_KEY!,
+    ) as JwtPayload;
+    ws.user = { username: decodedUser.username, id: decodedUser.id };
+
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
 async function setupServer() {
   redisClient.on("error", (err) => {
     console.log("redis error : ", err);
@@ -323,6 +504,24 @@ async function setupServer() {
 
   await redisClient.connect();
   console.log("REDIS SET UP DONE");
+
+  wss.on("connection", (ws, req) => {
+    if (!verifyJwtToken(ws, req)) {
+      ws.close(400, "BAD_CONNECTION_URL");
+      return;
+    }
+
+    ws.on("message", async (networkData, isBinary) => {
+      if (isBinary) {
+        console.error("is binary data, ignoring");
+        return;
+      }
+
+      const jsonParsedData = JSON.parse(networkData.toString());
+      //
+      await handleWebSocketMessage(ws, jsonParsedData);
+    });
+  });
 
   app.listen(3001);
   console.log("LISTENING ON PORT 3001");
