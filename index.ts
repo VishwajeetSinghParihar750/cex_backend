@@ -64,8 +64,8 @@ type WS_RESPONSE_TYPE =
   | "order"
   | "fills"
   | "error" // for anything that did not succeed
-  | "orderbook_update_btc_usd"
-  | "orderbook_update_sol_usd";
+  | "depth_update_btc_usd"
+  | "depth_update_sol_usd";
 
 type WS_REQUEST = {
   type: WS_REQUEST_TYPE;
@@ -455,17 +455,17 @@ async function handleGetBalanceRequest(req: WS_REQUEST, ws: WebSocket) {
   }
 }
 
-type SUBSCRIBED_EVENT = "orderbook_update_sol_usd" | "orderbook_update_btc_usd";
+type SUBSCRIBED_EVENT = "depth_update_sol_usd" | "depth_update_btc_usd";
 
 let eventSubscriptions: Record<SUBSCRIBED_EVENT, HashSet<WebSocket>> = {
-  orderbook_update_btc_usd: new HashSet(),
-  orderbook_update_sol_usd: new HashSet(),
+  depth_update_btc_usd: new HashSet(),
+  depth_update_sol_usd: new HashSet(),
 };
 
 function setupEventSubscriptionHandling() {
-  publishOrderbookUpdateEvents();
+  publishDepthUpdateEvents();
 }
-async function publishOrderbookUpdateEvents() {
+async function publishDepthUpdateEvents() {
   //
   const currentRedisClient = redisClient.duplicate();
   // duplicating coz this client will be kept on hold on block and no other guy would be able to use it, so creating a separate one from global redisClient
@@ -478,8 +478,8 @@ async function publishOrderbookUpdateEvents() {
       process.env.REDIS_ENGINE_UPDATES_GROUP_WORKER!,
       "worker1",
       [
-        { id: "$", key: "orderbook_update_btc_usd" },
-        { id: "$", key: "orderbook_update_sol_usd" },
+        { id: "$", key: "depth_update_btc_usd" },
+        { id: "$", key: "depth_update_sol_usd" },
       ],
       {
         BLOCK: 0,
@@ -525,11 +525,11 @@ async function handleSubscribeEventRequest(req: WS_REQUEST, ws: WebSocket) {
     const { eventType }: { eventType: SUBSCRIBED_EVENT } = req.payload;
 
     switch (eventType) {
-      case "orderbook_update_btc_usd":
-        eventSubscriptions.orderbook_update_btc_usd.insert(ws);
+      case "depth_update_btc_usd":
+        eventSubscriptions.depth_update_btc_usd.insert(ws);
         break;
-      case "orderbook_update_sol_usd":
-        eventSubscriptions.orderbook_update_sol_usd.insert(ws);
+      case "depth_update_sol_usd":
+        eventSubscriptions.depth_update_sol_usd.insert(ws);
         break;
 
       default:
@@ -549,11 +549,11 @@ async function handleUnsubscribeEventRequest(req: WS_REQUEST, ws: WebSocket) {
     const { eventType }: { eventType: SUBSCRIBED_EVENT } = req.payload;
 
     switch (eventType) {
-      case "orderbook_update_btc_usd":
-        eventSubscriptions.orderbook_update_btc_usd.eraseElementByKey(ws);
+      case "depth_update_btc_usd":
+        eventSubscriptions.depth_update_btc_usd.eraseElementByKey(ws);
         break;
-      case "orderbook_update_sol_usd":
-        eventSubscriptions.orderbook_update_sol_usd.eraseElementByKey(ws);
+      case "depth_update_sol_usd":
+        eventSubscriptions.depth_update_sol_usd.eraseElementByKey(ws);
         break;
 
       default:
