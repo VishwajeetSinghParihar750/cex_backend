@@ -474,7 +474,9 @@ async function publishOrderbookUpdateEvents() {
   await currentRedisClient.connect();
 
   while (true) {
-    const streamsReadResponse = await currentRedisClient.xRead(
+    const streamsReadResponse = await currentRedisClient.xReadGroup(
+      process.env.REDIS_ENGINE_UPDATES_GROUP_WORKER!,
+      "worker1",
       [
         { id: "$", key: "orderbook_update_btc_usd" },
         { id: "$", key: "orderbook_update_sol_usd" },
