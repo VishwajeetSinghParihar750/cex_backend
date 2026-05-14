@@ -473,13 +473,22 @@ async function publishDepthUpdateEvents() {
 
   await currentRedisClient.connect();
 
+  // create the consumer group  first
+  // this is assumed to be last delivered message id
+  await redisClient.xGroupCreate(
+    "depth_update_btc_usd",
+    process.env.REDIS_ENGINE_UPDATES_GROUP!,
+    "0",
+    { MKSTREAM: true },
+  );
+
   while (true) {
     const streamsReadResponse = await currentRedisClient.xReadGroup(
-      process.env.REDIS_ENGINE_UPDATES_GROUP_WORKER!,
-      "worker1",
+      process.env.REDIS_ENGINE_UPDATES_GROUP!,
+      "worker1", // coz there is only one worker per group , so no .env needed
       [
-        { id: "$", key: "depth_update_btc_usd" },
-        { id: "$", key: "depth_update_sol_usd" },
+        { id: "0", key: "depth_update_btc_usd" }, // this id is what u want right now from stream
+        { id: "0", key: "depth_update_sol_usd" },
       ],
       {
         BLOCK: 0,
@@ -495,28 +504,38 @@ async function publishDepthUpdateEvents() {
     //       };
     //   }[]
 
-    (streamsReadResponse as any).forEach((streamReadResponse: any) => {
-      (streamReadResponse as any).messages.forEach(
-        ({ message }: { message: any }) => {
-          let subscriptions =
-            eventSubscriptions[streamReadResponse.name as SUBSCRIBED_EVENT];
-          if (subscriptions.empty()) return;
+    await Promise.all(
+      (streamsReadResponse as any).map(async (streamReadResponse: any) => {
+        (streamReadResponse as any).messages.map(
+          async ({ id, message }: { id: any; message: any }) => {
+            let subscriptions =
+              eventSubscriptions[streamReadResponse.name as SUBSCRIBED_EVENT];
 
-          const {
-            offset,
-            data,
-          }: { offset: number; data: { price: number; qty: number }[] } =
-            message;
+            if (!subscriptions.empty()) {
+              const {
+                offset,
+                data,
+              }: { offset: number; data: { price: number; qty: number }[] } =
+                message;
 
-          subscriptions.forEach((ws) => {
-            sendMessageOnWebSocket(ws, {
-              payload: { offset, data },
-              type: streamReadResponse.name as SUBSCRIBED_EVENT,
-            });
-          });
-        },
-      );
-    });
+              subscriptions.forEach((ws) => {
+                sendMessageOnWebSocket(ws, {
+                  payload: { offset, data },
+                  type: streamReadResponse.name as SUBSCRIBED_EVENT,
+                });
+              });
+            }
+
+            // ack redis for messagie
+            await redisClient.xAck(
+              streamReadResponse.name,
+              process.env.REDIS_ENGINE_UPDATES_GROUP!,
+              id,
+            );
+          },
+        );
+      }),
+    );
   }
 }
 
