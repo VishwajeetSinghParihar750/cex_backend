@@ -366,4 +366,4 @@ const handleWebSocketMessage = async (ws: WebSocket, request: WS_REQUEST) => {
   }
 };
 
-export { handleWebSocketMessage };
+export { handleWebSocketMessage, engine as wsEngineInterface };
