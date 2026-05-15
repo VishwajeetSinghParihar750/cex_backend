@@ -73,40 +73,38 @@ class EngineInterface {
       //       };
       //   }[]
 
-      await Promise.all(
-        (streamsReadResponse as any).map(async (streamReadResponse: any) => {
-          (streamReadResponse as any).messages.map(
-            async ({ id, message }: { id: any; message: any }) => {
-              let subscriptions =
-                this.eventSubscriptions[
-                  streamReadResponse.name as SUBSCRIBED_EVENT
-                ];
+      for (let streamReadResponse of streamsReadResponse as any) {
+        for (const { id, message } of streamReadResponse.messages) {
+          let subscriptions =
+            this.eventSubscriptions[
+              streamReadResponse.name as SUBSCRIBED_EVENT
+            ];
 
-              if (!subscriptions.empty()) {
-                const {
-                  offset,
-                  data,
-                }: { offset: number; data: { price: number; qty: number }[] } =
-                  message;
+          if (!subscriptions.empty()) {
+            const {
+              offset,
+              data,
+            }: {
+              offset: number;
+              data: { price: number; qty: number }[];
+            } = message;
 
-                subscriptions.forEach((ws) => {
-                  sendMessageOnWebSocket(ws, {
-                    payload: { offset, data },
-                    type: streamReadResponse.name as SUBSCRIBED_EVENT,
-                  });
-                });
-              }
+            subscriptions.forEach((ws) => {
+              sendMessageOnWebSocket(ws, {
+                payload: { offset, data },
+                type: streamReadResponse.name as SUBSCRIBED_EVENT,
+              });
+            });
+          }
 
-              // ack redis for messagie
-              await this.redisClient.xAck(
-                streamReadResponse.name,
-                process.env.REDIS_ENGINE_UPDATES_GROUP!,
-                id,
-              );
-            },
+          // ack redis for messagie
+          await this.redisClient.xAck(
+            streamReadResponse.name,
+            process.env.REDIS_ENGINE_UPDATES_GROUP!,
+            id,
           );
-        }),
-      );
+        }
+      }
     }
   };
 
