@@ -1,4 +1,5 @@
 import app from "./app.js";
+import { redisClient as globalRedisClient } from "./db/redis/index.js";
 import { wsServer } from "./ws/index.js";
 import { wsEngineInterface } from "./ws/handlers/index.js";
 
